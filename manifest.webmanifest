@@ -1,0 +1,30 @@
+{
+  "name": "zähler.",
+  "short_name": "zähler.",
+  "description": "Zählerstände für Strom, Gas und Wasser eintippen und sofort sehen, ob dein Abschlag reicht. Offline, ohne Konto, alles bleibt auf dem Gerät.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d0d10",
+  "theme_color": "#0d0d10",
+  "lang": "de",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
