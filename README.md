@@ -6,6 +6,12 @@ Jeder Haushalt zahlt jeden Monat einen Abschlag für Strom, Gas, Wasser oder Fer
 
 Reine Rechnung, keine KI, kein Server. Alles bleibt auf deinem Handy.
 
+<p align="center">
+  <img src="bilder/1-uebersicht.png" width="240" alt="">
+  <img src="bilder/2-verlauf.png" width="240" alt="">
+  <img src="bilder/3-detail.png" width="240" alt="">
+</p>
+
 ## Funktionen
 
 - **Zähler** für Strom, Gas, Wasser, Fernwärme und Sonstiges, mit Arbeitspreis, Grundpreis, Abschlag, Abrechnungsbeginn und Startstand von der letzten Rechnung
