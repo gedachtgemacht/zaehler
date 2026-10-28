@@ -168,6 +168,7 @@ svg.chart text{font:11px var(--mono);fill:var(--mu)}
 .mt.sm svg{width:19px;height:19px}
 .mcard{display:block;width:100%;text-align:left;color:inherit;font:inherit;cursor:pointer;transition:border-color .15s}
 .mcard:active{border-color:var(--mu2)}
+.mcard.sub{margin-left:14px;width:calc(100% - 14px)}
 .top{display:flex;align-items:center;gap:12px}
 .top .m{flex:1;min-width:0}
 .nm{font-weight:600;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -659,6 +660,36 @@ const Z = (() => {
     return res;
   }
 
+  // Sammel-Abschlag (z. B. Nebenkosten-Pauschale): Zähler der Gruppe plus Festposten gegen einen gemeinsamen Abschlag.
+  // members: [{ m, A }], A aus analyze(); deren eigener Abschlag spielt keine Rolle.
+  const fixedYear = g => (g.fixed || []).reduce((s, x) => s + (+x.amount || 0) * (x.per === 'year' ? 1 : 12), 0);
+  function analyzeGroup(g, members, today) {
+    const P = period(g), T = P.T;
+    const tf = tariffs({ price: 0, base: 0, advance: g.advance, changes: (g.changes || []).map(c => ({ from: c.from, advance: c.advance })) }, P);
+    const paidTo = b => { let paid = 0; for (let i = 0; i < tf.length; i++) { const lo = tf[i].t, hi = Math.min(b, i + 1 < tf.length ? tf[i + 1].t : Infinity); if (hi > lo) paid += tf[i].adv * 12 * (hi - lo) / T; } return paid; };
+    const parts = members.map(({ m, A }) => ({ id: m.id, name: m.name, cost: A.Y != null ? A.cost : null, lo: A.Y != null ? A.diffLow : null, hi: A.Y != null ? A.diffHigh : null }));
+    const known = parts.filter(x => x.cost != null), missing = parts.filter(x => x.cost == null);
+    const fixed = fixedYear(g);
+    const res = { P, T, parts, missing, complete: !missing.length, fixed };
+    res.todayT = Math.max(0, Math.min(T, dn(today) - P.s));
+    res.progress = T > 0 ? res.todayT / T : 0;
+    res.over = dn(today) >= P.e;
+    res.current = tf.find((x, i) => res.todayT >= x.t && (i + 1 >= tf.length || res.todayT < tf[i + 1].t)) || tf[0];
+    res.tariffs = tf;
+    res.cost = known.reduce((a, x) => a + x.cost, 0) + fixed;
+    res.paid = paidTo(T); res.diff = res.cost - res.paid;
+    res.diffLow = known.reduce((a, x) => a + x.lo, 0) + fixed - res.paid;
+    res.diffHigh = known.reduce((a, x) => a + x.hi, 0) + fixed - res.paid;
+    res.rel = res.cost > 0 ? (res.diffHigh - res.diffLow) / 2 / res.cost : 0;
+    res.recommend = res.cost > 0 ? Math.ceil(res.cost / 12 - 1e-9) : 0;
+    const remMo = 12 * (T - res.todayT) / T;
+    res.needFromNow = remMo >= 1 ? Math.max(0, Math.ceil((res.cost - paidTo(res.todayT)) / remMo - 1e-9)) : null;
+    const ratio = res.cost > 0 ? res.diff / res.cost : 0;
+    res.ratio = ratio;
+    res.status = !res.complete ? 'none' : ratio <= 0.03 ? 'ok' : ratio <= 0.12 ? 'wa' : 'ba';
+    return res;
+  }
+
   // Abschluss einer Periode zum neuen Beginn (für das Archiv)
   // Abschluss bis zur letzten Ablesung: tatsächlicher Verbrauch, Kosten und Zahlungen dieser Spanne
   function settle(m, readings, today) {
@@ -707,7 +738,7 @@ const Z = (() => {
     return out;
   }
 
-  return { PROF, dn, iso, addMonths, weights, period, factor, billUnit, tariffs, series, analyze, settle, check };
+  return { PROF, dn, iso, addMonths, weights, period, factor, billUnit, tariffs, series, analyze, analyzeGroup, fixedYear, settle, check };
 })();
 if (typeof module !== 'undefined') module.exports = Z;
 /*@calc-end@*/
@@ -727,7 +758,7 @@ if (typeof module !== 'undefined') module.exports = Z;
   const ST = { ok: 'reicht', wa: 'knapp', ba: 'reicht nicht', none: 'noch offen' };
   const MI = 'JFMAMJJASOND';
   const MN = ['januar', 'februar', 'märz', 'april', 'mai', 'juni', 'juli', 'august', 'september', 'oktober', 'november', 'dezember'];
-  const S = { tab: 'home', detail: null, filter: 'all', meters: [], readings: [], periods: [], meta: { id: 'settings', remindDay: 1 } };
+  const S = { tab: 'home', detail: null, filter: 'all', meters: [], groups: [], readings: [], periods: [], meta: { id: 'settings', remindDay: 1 } };
   let db;
 
   /* ---------- Format ---------- */
@@ -747,8 +778,18 @@ if (typeof module !== 'undefined') module.exports = Z;
     return 'Spanne ' + side(lo) + ' bis ' + side(hi);
   }
   const tday = () => gg.today();
-  const an = m => Z.analyze(m, S.readings, tday());
   const meterById = id => S.meters.find(m => m.id === id);
+  const groupById = id => id ? S.groups.find(g => g.id === id) : null;
+  const grpOf = m => groupById(m.group);
+  const membersOf = g => S.meters.filter(m => m.group === g.id);
+  // Zähler im Sammel-Abschlag zahlen nicht selbst: eigener Abschlag zählt als 0, es bleiben die Kosten
+  const an = m => {
+    if (!grpOf(m)) return Z.analyze(m, S.readings, tday());
+    const A = Z.analyze({ ...m, advance: 0, changes: (m.changes || []).map(c => ({ ...c, advance: 0 })) }, S.readings, tday());
+    A.budgetY = null; A.budget = () => null; return A;
+  };
+  const anG = g => Z.analyzeGroup(g, membersOf(g).map(m => ({ m, A: an(m) })), tday());
+  const isGroup = id => !!groupById(id);
   const bu = m => Z.billUnit(m);
   const lastOf = m => { const p = Z.series(m, S.readings); return p[p.length - 1] || null; };
   const isoOf = (A, t) => Z.iso(A.P.s + Math.round(t));
@@ -756,11 +797,12 @@ if (typeof module !== 'undefined') module.exports = Z;
 
   /* ---------- Daten ---------- */
   async function load() {
-    const [m, r, p, meta] = await Promise.all([db.all('meters'), db.all('readings'), db.all('periods'), db.get('meta', 'settings')]);
+    const [m, r, p, meta, gr] = await Promise.all([db.all('meters'), db.all('readings'), db.all('periods'), db.get('meta', 'settings'), db.all('groups')]);
+    S.groups = (gr || []).sort((a, b) => (a.created || 0) - (b.created || 0));
     S.meters = (m || []).sort((a, b) => (a.created || 0) - (b.created || 0));
     S.readings = r || []; S.periods = (p || []).sort((a, b) => a.start < b.start ? 1 : -1);
     S.meta = meta || { id: 'settings', remindDay: 1 };
-    if (S.detail && !meterById(S.detail)) S.detail = null;
+    if (S.detail && !meterById(S.detail) && !groupById(S.detail)) S.detail = null;
   }
   async function saveMeta() { await db.put('meta', S.meta); }
   async function persistOnce() {
@@ -772,9 +814,9 @@ if (typeof module !== 'undefined') module.exports = Z;
   function render() {
     const tabs = $$('#tabs button'); tabs.forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab));
     const fab = $('#fab');
-    fab.classList.toggle('hide', !S.meters.length || S.tab === 'more');
+    fab.classList.toggle('hide', !S.meters.length || (S.tab === 'more' && !S.detail) || isGroup(S.detail));
     const v = $('#view');
-    if (S.detail) renderDetail(v); else if (S.tab === 'home') renderHome(v); else if (S.tab === 'hist') renderHist(v); else renderMore(v);
+    if (isGroup(S.detail)) renderGroup(v); else if (S.detail) renderDetail(v); else if (S.tab === 'home') renderHome(v); else if (S.tab === 'hist') renderHist(v); else renderMore(v);
   }
   function bar(html) { $('#bar').innerHTML = html; }
   const brand = '<div class="brand">zähler<b>.</b></div>';
@@ -782,27 +824,57 @@ if (typeof module !== 'undefined') module.exports = Z;
   /* ---------- Übersicht ---------- */
   function renderHome(v) {
     bar(brand + (S.meters.length ? '<button class="icon-btn" data-act="newMeter" aria-label="Zähler anlegen">' + ic('plus') + '</button>' : ''));
-    if (!S.meters.length) { v.innerHTML = emptyHTML(); return; }
-    const rows = S.meters.map(m => ({ m, A: an(m) }));
+    if (!S.meters.length && !S.groups.length) { v.innerHTML = emptyHTML(); return; }
+    // Einheiten, die einen Abschlag haben: Sammel-Abschläge und Zähler ohne Gruppe
+    const solo = S.meters.filter(m => !grpOf(m)).map(m => ({ A: an(m) }));
+    const grps = S.groups.map(g => ({ g, GA: anG(g) }));
+    const units = solo.map(x => ({ ok: x.A.Y != null, A: x.A })).concat(grps.map(x => ({ ok: x.GA.complete, A: x.GA })));
     let h = '';
     if (S.meters.some(m => m.demo)) h += '<div class="card tight demo-b"><span class="chip ac">Beispiel</span><p>Beispieldaten zum Ausprobieren.</p><button class="btn sm" data-act="demoOff">Entfernen</button></div>';
-    const est = rows.filter(x => x.A.Y != null);
-    if (rows.length > 1 && est.length) {
-      const tot = est.reduce((s, x) => s + x.A.diff, 0), adv = rows.reduce((s, x) => s + (x.A.current.adv || 0), 0), rec = est.reduce((s, x) => s + x.A.recommend, 0);
+    const est = units.filter(x => x.ok);
+    if (units.length > 1 && est.length) {
+      const tot = est.reduce((s, x) => s + x.A.diff, 0), adv = est.reduce((s, x) => s + (x.A.current.adv || 0), 0), rec = est.reduce((s, x) => s + x.A.recommend, 0);
       const hd = head(tot);
-      h += '<div class="card hero"><div class="k">alle zähler zusammen, erwartet</div><div class="head" style="margin:8px 0 0"><span class="big ' + (tot > 0 ? 'ba' : 'ok') + '" style="font-size:30px">' + hd.h + '</span><span class="lbl">' + hd.l + '</span></div>'
+      h += '<div class="card hero"><div class="k">alles zusammen, erwartet</div><div class="head" style="margin:8px 0 0"><span class="big ' + (tot > 0 ? 'ba' : 'ok') + '" style="font-size:30px">' + hd.h + '</span><span class="lbl">' + hd.l + '</span></div>'
         + '<div class="row3"><div>Abschläge<b class="mono">' + e0(adv) + '</b></div><div>empfohlen<b class="mono">' + e0(rec) + '</b></div><div>pro Monat<b class="mono">' + (rec - adv > 0 ? '+ ' : '') + gg.num(rec - adv) + ' €</b></div></div></div>';
     }
-    h += '<div class="h">deine zähler<span class="r">' + S.meters.length + '</span></div>';
-    rows.forEach(({ m, A }) => { h += meterCard(m, A); });
+    if (grps.length) {
+      h += '<div class="h">sammel-abschlag<span class="r">' + grps.length + '</span></div>';
+      grps.forEach(({ g, GA }) => { h += groupCard(g, GA); membersOf(g).forEach(m => { h += meterCard(m, an(m)); }); });
+    }
+    const loose = S.meters.filter(m => !grpOf(m));
+    if (loose.length) { h += '<div class="h">' + (grps.length ? 'einzelne ' : 'deine ') + 'zähler<span class="r">' + loose.length + '</span></div>'; loose.forEach(m => { h += meterCard(m, an(m)); }); }
+    h += '<button class="btn block" data-act="newGroup" style="margin-top:14px">' + ic('home') + 'Nebenkosten-Pauschale anlegen</button>'
+      + '<p class="tiny muted" style="margin:8px 2px 0">Für einen Abschlag, der Wasser, Heizung und mehr zusammen deckt, zum Beispiel 150 € Nebenkosten im Monat.</p>';
     v.innerHTML = h;
   }
+  function groupCard(g, GA) {
+    const mem = membersOf(g), fx = (g.fixed || []).length;
+    const sub = (GA.over ? 'beendet am ' : 'bis ') + gg.date(GA.P.last);
+    let h = '<button class="card mcard" data-open="' + g.id + '"><div class="top"><div class="mt">' + ic('home') + '</div><div class="m"><div class="nm">' + esc(g.name) + '</div><div class="sb2">' + esc(sub) + '</div></div>'
+      + '<span class="chip ' + (GA.status === 'none' ? '' : GA.status) + '"><span class="dot ' + (GA.status === 'none' ? '' : GA.status) + '" style="width:7px;height:7px"></span>' + ST[GA.status] + '</span></div>';
+    if (GA.complete) {
+      const hd = head(GA.diff), rt = GA.rel > 0.02 ? rangeText(GA.diffLow, GA.diffHigh) : '';
+      h += '<div class="head"><span class="big ' + GA.status + '">' + hd.h + '</span><span class="lbl">' + hd.l + '</span></div><div class="range">' + (rt ? esc(rt) : '&nbsp;') + '</div>'
+        + '<div class="adv">Abschlag <b>' + e0(GA.current.adv) + '</b><span class="arr">→</span> empfohlen <b>' + e0(GA.recommend) + '</b></div>';
+    } else {
+      h += '<div class="head"><span class="big none">? €</span><span class="lbl">noch keine Schätzung</span></div><div class="range">Es fehlt noch: ' + esc(GA.missing.map(x => x.name).join(', ')) + '</div>'
+        + '<div class="adv">Abschlag <b>' + e0(GA.current.adv) + '</b></div>';
+    }
+    h += '<div class="meter"><i style="width:' + Math.round(GA.progress * 100) + '%"></i></div>';
+    const left = gg.days(tday(), GA.P.end);
+    h += '<div class="pline"><span>' + (GA.over ? 'Periode vorbei' : 'noch ' + left + (left === 1 ? ' Tag' : ' Tage')) + '</span><span>' + mem.length + ' Zähler' + (fx ? ' · ' + fx + ' Festposten' : '') + '</span></div>';
+    return h + '</button>';
+  }
   function meterCard(m, A) {
-    const t = TYPES[m.type] || TYPES.sonst;
+    const t = TYPES[m.type] || TYPES.sonst, G = grpOf(m);
     const sub = (A.over ? 'beendet am ' : 'bis ') + gg.date(A.P.last);
-    let h = '<button class="card mcard" data-open="' + m.id + '"><div class="top"><div class="mt">' + ic(t.icon) + '</div><div class="m"><div class="nm">' + esc(m.name) + '</div><div class="sb2">' + esc(sub) + '</div></div>'
-      + '<span class="chip ' + (A.status === 'none' ? '' : A.status) + '"><span class="dot ' + (A.status === 'none' ? '' : A.status) + '" style="width:7px;height:7px"></span>' + ST[A.status] + '</span></div>';
-    if (A.Y != null) {
+    let h = '<button class="card mcard' + (G ? ' sub' : '') + '" data-open="' + m.id + '"><div class="top"><div class="mt">' + ic(t.icon) + '</div><div class="m"><div class="nm">' + esc(m.name) + '</div><div class="sb2">' + esc(sub) + '</div></div>'
+      + (G ? '<span class="chip ac">in ' + esc(G.name) + '</span>' : '<span class="chip ' + (A.status === 'none' ? '' : A.status) + '"><span class="dot ' + (A.status === 'none' ? '' : A.status) + '" style="width:7px;height:7px"></span>' + ST[A.status] + '</span>') + '</div>';
+    if (G) {
+      if (A.Y != null) h += '<div class="head"><span class="big none">' + e0(A.cost) + '</span><span class="lbl">Kosten im Jahr</span></div><div class="range">' + (A.mode === 'final' ? 'Periode vollständig abgelesen' : '&nbsp;') + '</div>';
+      else h += '<div class="head"><span class="big none">? €</span><span class="lbl">noch keine Schätzung</span></div><div class="range">' + (A.pts.length ? 'Noch zu wenig Tage seit Abrechnungsbeginn.' : 'Trag deinen ersten Zählerstand ein.') + '</div>';
+    } else if (A.Y != null) {
       const hd = head(A.diff);
       h += '<div class="head"><span class="big ' + A.status + '">' + hd.h + '</span><span class="lbl">' + hd.l + '</span></div>';
       const rt = A.rel > 0.02 ? rangeText(A.diffLow, A.diffHigh) : '';
@@ -822,7 +894,7 @@ if (typeof module !== 'undefined') module.exports = Z;
   }
   function emptyHTML() {
     return '<div class="empty"><div class="ico">' + ic('chart') + '</div><h3>Reicht dein Abschlag?</h3><p>Tipp einmal im Monat deine Zählerstände ein. zähler. rechnet aufs Jahr hoch und sagt dir früh, ob eine Nachzahlung kommt.</p>'
-      + '<div class="btns"><button class="btn primary" data-act="newMeter">' + ic('plus') + 'Zähler anlegen</button><button class="btn" data-act="demoOn">Beispiel ansehen</button></div></div>'
+      + '<div class="btns"><button class="btn primary" data-act="newMeter">' + ic('plus') + 'Zähler anlegen</button><button class="btn" data-act="demoOn">Beispiel ansehen</button></div><div class="btns" style="margin-top:0"><button class="btn" data-act="newGroup">Nebenkosten-Pauschale anlegen</button></div></div>'
       + '<div class="feat">'
       + feat('bolt', 'Strom, Gas, Wasser, Fernwärme', 'Mit Grundpreis, Arbeitspreis und deinem monatlichen Abschlag.')
       + feat('flame', 'Rechnet mit den Jahreszeiten', 'Im Sommer heizt niemand. Gas wird nach typischem Heizprofil hochgerechnet, nicht einfach linear.')
@@ -834,12 +906,17 @@ if (typeof module !== 'undefined') module.exports = Z;
   /* ---------- Detail ---------- */
   function renderDetail(v) {
     const m = meterById(S.detail); if (!m) { S.detail = null; return render(); }
-    const A = an(m), t = TYPES[m.type] || TYPES.sonst, U = bu(m);
+    const A = an(m), t = TYPES[m.type] || TYPES.sonst, U = bu(m), G = grpOf(m);
     bar('<button class="icon-btn back" data-act="back" aria-label="Zurück">' + ic('back') + '</button><div class="ttl">' + esc(m.name) + '</div>' + (m.demo ? '<span class="chip ac">Beispiel</span>' : '') + '<button class="icon-btn" data-act="editMeter" aria-label="Zähler bearbeiten">' + ic('edit') + '</button>');
     let h = '';
     // Kopf
-    h += '<div class="card"><div class="top"><div class="mt">' + ic(t.icon) + '</div><div class="m"><div class="nm">' + esc(t.label) + (m.number ? ' <span class="mono muted" style="font-weight:400;font-size:13px">' + esc(m.number) + '</span>' : '') + '</div><div class="sb2">' + gg.dateShort(A.P.start) + ' bis ' + gg.date(A.P.last) + '</div></div><span class="chip ' + (A.status === 'none' ? '' : A.status) + '">' + ST[A.status] + '</span></div>';
-    if (A.Y != null) {
+    h += '<div class="card"><div class="top"><div class="mt">' + ic(t.icon) + '</div><div class="m"><div class="nm">' + esc(t.label) + (m.number ? ' <span class="mono muted" style="font-weight:400;font-size:13px">' + esc(m.number) + '</span>' : '') + '</div><div class="sb2">' + gg.dateShort(A.P.start) + ' bis ' + gg.date(A.P.last) + '</div></div>' + (G ? '<span class="chip ac">in ' + esc(G.name) + '</span>' : '<span class="chip ' + (A.status === 'none' ? '' : A.status) + '">' + ST[A.status] + '</span>') + '</div>';
+    if (G && A.Y != null) {
+      h += '<div class="head"><span class="big none">' + e0(A.cost) + '</span><span class="lbl">Kosten im Jahr</span></div>';
+      const rt = A.rel > 0.02 ? 'Spanne ' + gg.num(r5(A.cost * (1 - A.rel))) + ' bis ' + gg.num(r5(A.cost * (1 + A.rel))) + ' €' : '';
+      if (rt) h += '<div class="range">' + esc(rt) + '</div>';
+      h += '<div class="note" style="margin:0">Den Abschlag zahlst du gesammelt über <b>' + esc(G.name) + '</b>. Ob er reicht, siehst du dort.<br><button class="btn sm" data-open="' + G.id + '" style="margin-top:10px">' + esc(G.name) + ' ansehen</button></div>';
+    } else if (A.Y != null) {
       const hd = head(A.diff);
       h += '<div class="head"><span class="big ' + A.status + '">' + hd.h + '</span><span class="lbl">' + hd.l + '</span></div>';
       const rt = A.rel > 0.02 ? rangeText(A.diffLow, A.diffHigh) : '';
@@ -862,10 +939,10 @@ if (typeof module !== 'undefined') module.exports = Z;
       h += '<div class="h">kennzahlen</div><div class="stats">'
         + stat('Verbrauch bisher', fc(A.used) + ' ' + U, conv ? fc(A.usedM) + ' ' + esc(m.unit) : (A.lastDate ? 'bis ' + gg.date(A.lastDate) : ''))
         + stat('Hochrechnung Jahr', A.Y != null ? fc(A.Y) + ' ' + U : '·', A.Y != null && A.rel > 0.02 ? '± ' + gg.num(A.rel * 100, 0) + ' %' : (A.mode === 'final' ? 'abgelesen' : ''))
-        + stat('Jahreskosten', A.Y != null ? e0(A.cost) : '·', A.Y != null ? 'gezahlt ' + e0(A.paid) : '')
+        + stat('Jahreskosten', A.Y != null ? e0(A.cost) : '·', A.Y != null && !G ? 'gezahlt ' + e0(A.paid) : '')
         + stat('Ø pro Tag', A.perDay != null ? gg.num(A.perDay, A.perDay < 10 ? 2 : 1) + ' ' + U : '·', A.perDay != null && A.Y != null ? 'Jahresschnitt ' + gg.num(A.Y / A.T, A.Y / A.T < 10 ? 2 : 1) : '')
         + stat('Vergleich Vorjahr', A.vsPrev != null ? (A.vsPrev > 0 ? '+ ' : A.vsPrev < 0 ? '− ' : '') + gg.num(Math.abs(A.vsPrev * 100), 0) + ' %' : '·', A.prev ? 'Vorjahr ' + fc(A.prev) + ' ' + U : 'Vorjahr fehlt', A.vsPrev == null ? '' : A.vsPrev > 0.05 ? 'wa' : A.vsPrev < -0.05 ? 'ok' : '')
-        + stat('Bisher fällig', A.Y != null ? e0(A.dueSoFar) : '·', A.Y != null ? 'gezahlt ' + e0(A.paidSoFar) : '')
+        + stat('Bisher fällig', A.Y != null ? e0(A.dueSoFar) : '·', A.Y != null && !G ? 'gezahlt ' + e0(A.paidSoFar) : '')
         + '</div>';
       if (A.Fl > 0) h += '<p class="hint" style="margin:10px 2px 0">' + pct(A.Fl) + ' des Jahresverbrauchs fallen typischerweise in den Zeitraum ' + gg.dateShort(A.P.start) + ' bis ' + gg.dateShort(A.lastDate) + '</p>';
     }
@@ -890,12 +967,12 @@ if (typeof module !== 'undefined') module.exports = Z;
     // Tarif
     const C = A.current;
     h += '<div class="h">tarif</div><div class="card">'
-      + kv('Arbeitspreis', gg.num(C.price, 2) + ' ct/' + U) + kv('Grundpreis', gg.eur(C.base) + ' / Monat') + kv('Abschlag', gg.eur(C.adv) + ' / Monat')
+      + kv('Arbeitspreis', gg.num(C.price, 2) + ' ct/' + U) + kv('Grundpreis', gg.eur(C.base) + ' / Monat') + (G ? '' : kv('Abschlag', gg.eur(C.adv) + ' / Monat'))
       + (m.conv ? kv('Umrechnung', fin(m.hs) + ' × ' + fin(m.z) + ' = ' + fin(+A.factor.toFixed(3)) + ' kWh/m³') : '');
     const ch = (m.changes || []).slice().sort((a, b) => a.from < b.from ? -1 : 1);
     if (ch.length) {
       h += '<div class="sep"></div><div class="tiny muted mono" style="margin-bottom:4px">preisänderungen</div>';
-      ch.forEach((c, i) => { h += '<div class="tline"><span>ab ' + gg.date(c.from) + '</span><span class="mono">' + gg.num(c.price, 2) + ' ct · ' + gg.num(c.base, 2) + ' € · ' + gg.num(c.advance, 0) + ' €</span><button class="icon-btn" data-delchange="' + c.from + '" aria-label="Preisänderung löschen">' + ic('trash') + '</button></div>'; });
+      ch.forEach((c, i) => { h += '<div class="tline"><span>ab ' + gg.date(c.from) + '</span><span class="mono">' + gg.num(c.price, 2) + ' ct · ' + gg.num(c.base, 2) + ' €' + (G ? '' : ' · ' + gg.num(c.advance, 0) + ' €') + '</span><button class="icon-btn" data-delchange="' + c.from + '" aria-label="Preisänderung löschen">' + ic('trash') + '</button></div>'; });
     }
     h += '<p class="tiny muted" style="margin:10px 0 12px">Die Rechnung nutzt diese Preise. Ändert sich dein Tarif mitten im Jahr, trag die Änderung ab Datum ein. Sie wird tagesgenau berücksichtigt.</p>'
       + '<button class="btn sm block" data-act="priceChange">' + ic('euro') + 'Preisänderung ab Datum</button></div>';
@@ -905,7 +982,7 @@ if (typeof module !== 'undefined') module.exports = Z;
     const per = S.periods.filter(p => p.meterId === m.id);
     if (per.length) {
       h += '<div class="h">frühere perioden</div><div class="list">';
-      per.forEach(p => { const hd = head(p.diff); h += '<div class="item" style="cursor:default"><div class="m"><div class="t">' + gg.date(p.start) + ' bis ' + gg.date(gg.addDays(p.end, -1)) + '</div><div class="s mono">' + fc(p.cons) + ' ' + esc(p.unit) + ' · Kosten ' + e0(p.cost) + '</div></div><div class="e"><div class="' + (p.diff > 0 ? 'ba' : 'ok') + '">' + hd.n + '</div><div class="s">' + hd.l + '</div></div></div>'; });
+      per.forEach(p => { const hd = head(p.diff); h += '<div class="item" style="cursor:default"><div class="m"><div class="t">' + gg.date(p.start) + ' bis ' + gg.date(gg.addDays(p.end, -1)) + '</div><div class="s mono">' + fc(p.cons) + ' ' + esc(p.unit) + ' · Kosten ' + e0(p.cost) + '</div></div><div class="e">' + (G ? '<div>' + e0(p.cost) + '</div><div class="s">Kosten</div>' : '<div class="' + (p.diff > 0 ? 'ba' : 'ok') + '">' + hd.n + '</div><div class="s">' + hd.l + '</div>') + '</div></div>'; });
       h += '</div>';
     }
     h += '<div class="h">aktionen</div><div class="list">'
@@ -915,6 +992,150 @@ if (typeof module !== 'undefined') module.exports = Z;
     v.innerHTML = h;
     hoverCum($('#cum'), m, A); hoverMon($('#mon'), m, A);
   }
+  /* ---------- Sammel-Abschlag (Nebenkosten-Pauschale) ---------- */
+  function renderGroup(v) {
+    const g = groupById(S.detail), GA = anG(g), mem = membersOf(g);
+    bar('<button class="icon-btn back" data-act="back" aria-label="Zurück">' + ic('back') + '</button><div class="ttl">' + esc(g.name) + '</div><button class="icon-btn" data-act="editGroup" aria-label="Bearbeiten">' + ic('edit') + '</button>');
+    let h = '<div class="card"><div class="top"><div class="mt">' + ic('home') + '</div><div class="m"><div class="nm">Sammel-Abschlag</div><div class="sb2">' + gg.dateShort(GA.P.start) + ' bis ' + gg.date(GA.P.last) + '</div></div><span class="chip ' + (GA.status === 'none' ? '' : GA.status) + '">' + ST[GA.status] + '</span></div>';
+    if (GA.complete) {
+      const hd = head(GA.diff), rt = GA.rel > 0.02 ? rangeText(GA.diffLow, GA.diffHigh) : '';
+      h += '<div class="head"><span class="big ' + GA.status + '">' + hd.h + '</span><span class="lbl">' + hd.l + '</span></div>' + (rt ? '<div class="range">' + esc(rt) + '</div>' : '')
+        + '<div class="adv">Abschlag <b>' + e0(GA.current.adv) + '</b><span class="arr">→</span> empfohlen <b>' + e0(GA.recommend) + '</b></div>';
+      let msg;
+      if (GA.status === 'ok') msg = 'Dein Abschlag passt. Wenn du so weiter verbrauchst, kommt keine nennenswerte Nachzahlung.';
+      else msg = 'Wenn du so weiter verbrauchst, fehlen am Periodenende etwa <b>' + e0(GA.diff) + '</b>.' + (GA.needFromNow != null && GA.needFromNow > GA.recommend ? ' Um das bis dahin aufzufangen, bräuchtest du ab jetzt <b>' + e0(GA.needFromNow) + '</b> im Monat.' : ' Erhöh deinen Abschlag auf <b>' + e0(GA.recommend) + '</b>, dann passt es.');
+      h += '<div class="note" style="margin:0">' + msg + '</div>';
+    } else {
+      h += '<div class="head"><span class="big none">? €</span><span class="lbl">noch keine Schätzung</span></div>'
+        + '<div class="note" style="margin:14px 0 0">Für <b>' + esc(GA.missing.map(x => x.name).join(', ')) + '</b> fehlt noch eine Schätzung. Trag dort einen Zählerstand ein, mit dem Vorjahresverbrauch aus der letzten Rechnung geht es schneller.' + (GA.cost > 0 ? ' Bisher stehen ' + e0(GA.cost) + ' im Jahr fest.' : '') + '</div>';
+    }
+    h += '</div>';
+    if (GA.over) h += '<div class="warn"><b>Periode beendet.</b> Der Abrechnungszeitraum endete am ' + gg.date(GA.P.last) + '. Starte die nächste Periode, sobald die Abrechnung da ist.<br><button class="btn sm primary" data-act="groupPeriod">Neue Abrechnungsperiode</button></div>';
+    // Posten
+    h += '<div class="h">was im abschlag steckt<span class="r">' + e0(GA.cost) + ' / Jahr</span></div><div class="list">';
+    GA.parts.forEach(x => {
+      const m = meterById(x.id), t = TYPES[m.type] || TYPES.sonst;
+      h += '<button class="item" data-open="' + m.id + '"><span class="thumb">' + ic(t.icon) + '</span><div class="m"><div class="t">' + esc(m.name) + '</div><div class="s">' + esc(t.label) + ' · Zähler</div></div><div class="e"><div>' + (x.cost != null ? e0(x.cost) : '·') + '</div><div class="s">' + (x.cost != null ? 'geschätzt' : 'noch offen') + '</div></div></button>';
+    });
+    (g.fixed || []).forEach(x => {
+      const yr = (+x.amount || 0) * (x.per === 'year' ? 1 : 12);
+      h += '<button class="item" data-item="' + x.id + '"><span class="thumb">' + ic('receipt') + '</span><div class="m"><div class="t">' + esc(x.name) + '</div><div class="s">Festposten · ' + gg.eur(+x.amount || 0) + (x.per === 'year' ? ' / Jahr' : ' / Monat') + '</div></div><div class="e"><div>' + e0(yr) + '</div><div class="s">fest</div></div></button>';
+    });
+    if (!GA.parts.length && !(g.fixed || []).length) h += '<div class="item" style="cursor:default"><div class="m"><div class="s">Noch nichts drin. Füg Zähler und Festposten hinzu.</div></div></div>';
+    h += '</div><div class="flex" style="margin-top:10px"><button class="btn sm" data-act="addItem">' + ic('plus') + 'Festposten</button><button class="btn sm" data-act="newMeter">' + ic('plus') + 'Zähler</button></div>'
+      + '<p class="tiny muted" style="margin:10px 2px 0">Festposten sind Kosten ohne Zähler, zum Beispiel Versicherung, Grundpacht, Müll oder Garten. Zähler sind Warmwasser, Kaltwasser, Gas und alles, was du abliest.</p>';
+    // Abschlag
+    h += '<div class="h">abschlag</div><div class="card">' + kv('Abschlag', gg.eur(GA.current.adv) + ' / Monat') + kv('Pro Jahr', gg.eur(GA.paid));
+    const ch = (g.changes || []).slice().sort((a, b) => a.from < b.from ? -1 : 1);
+    if (ch.length) {
+      h += '<div class="sep"></div><div class="tiny muted mono" style="margin-bottom:4px">änderungen</div>';
+      ch.forEach(c => { h += '<div class="tline"><span>ab ' + gg.date(c.from) + '</span><span class="mono">' + gg.num(c.advance, 0) + ' €</span><button class="icon-btn" data-delchange="' + c.from + '" aria-label="Änderung löschen">' + ic('trash') + '</button></div>'; });
+    }
+    h += '<p class="tiny muted" style="margin:10px 0 12px">Ändert der Vermieter den Abschlag mitten im Jahr, trag ihn ab Datum ein. Er wird tagesgenau berücksichtigt.</p><button class="btn sm block" data-act="groupPrice">' + ic('euro') + 'Abschlag ab Datum ändern</button></div>';
+    h += '<details class="how"><summary>' + ic('search').replace('<svg', '<svg style="width:18px;height:18px;stroke:var(--mu);fill:none;stroke-width:1.8"') + 'So rechnen wir</summary><div class="in">'
+      + '<p>Jeder Zähler wird einzeln hochgerechnet, wie bei einem normalen Zähler. Dazu kommen die Festposten für ein Jahr. Das ergibt die <b>Jahreskosten</b>.</p>'
+      + '<p>Davon ziehen wir 12 Abschläge ab. Der Rest ist die erwartete Nachzahlung oder das Guthaben. Fehlt für einen Zähler noch die Schätzung, gibt es noch kein Ergebnis, damit die Ampel nicht zu früh grün wird.</p>'
+      + (GA.complete ? '<div class="fx">' + GA.parts.map(x => esc(x.name) + ' ' + gg.eur(x.cost)).join('<br>') + (GA.parts.length ? '<br>' : '') + (GA.fixed ? '+ ' + gg.eur(GA.fixed) + ' <span class="muted">Festposten</span><br>' : '') + '= ' + gg.eur(GA.cost) + ' <span class="muted">Jahreskosten</span><br>− ' + gg.eur(GA.paid) + ' <span class="muted">Abschläge</span><br>= ' + gg.eur(Math.abs(GA.diff)) + ' ' + (GA.diff > 0 ? 'Nachzahlung' : 'Guthaben') + '</div>' : '')
+      + '<p><b>Ampel.</b> Grün: Guthaben oder höchstens 3 % Nachzahlung. Gelb: bis 12 %. Rot: mehr. Empfohlener Abschlag: Jahreskosten ÷ 12, aufgerundet.</p></div></details>';
+    const per = S.periods.filter(p => p.meterId === g.id);
+    if (per.length) {
+      h += '<div class="h">frühere perioden</div><div class="list">';
+      per.forEach(p => { const hd = head(p.diff); h += '<div class="item" style="cursor:default"><div class="m"><div class="t">' + gg.date(p.start) + ' bis ' + gg.date(gg.addDays(p.end, -1)) + '</div><div class="s mono">Kosten ' + e0(p.cost) + ' · gezahlt ' + e0(p.paid) + '</div></div><div class="e"><div class="' + (p.diff > 0 ? 'ba' : 'ok') + '">' + hd.n + '</div><div class="s">' + hd.l + '</div></div></div>'; });
+      h += '</div>';
+    }
+    h += '<div class="h">aktionen</div><div class="list">'
+      + '<button class="item" data-act="groupPeriod"><span class="thumb">' + ic('cal') + '</span><div class="m"><div class="t">Neue Abrechnungsperiode</div><div class="s">Ergebnis archivieren, Abschlag übernehmen</div></div><span class="chev">' + ic('back') + '</span></button>'
+      + '<button class="item" data-act="editGroup"><span class="thumb">' + ic('edit') + '</span><div class="m"><div class="t">Bearbeiten</div><div class="s">Name, Beginn, Abschlag</div></div><span class="chev">' + ic('back') + '</span></button>'
+      + '<button class="item" data-act="delGroup"><span class="thumb" style="color:var(--ba)">' + ic('trash') + '</span><div class="m"><div class="t" style="color:var(--ba)">Löschen</div><div class="s">die Zähler darin bleiben erhalten</div></div></button></div>';
+    v.innerHTML = h;
+  }
+
+  function groupSheet(g) {
+    const isNew = !g, y = new Date().getFullYear();
+    g = g ? JSON.parse(JSON.stringify(g)) : { name: 'Nebenkosten', start: y + '-01-01', advance: null, changes: [], fixed: [] };
+    const html = '<label class="field"><span>Name</span><input id="g-name" maxlength="40" placeholder="z. B. Nebenkosten" value="' + esc(g.name) + '"></label>'
+      + '<div class="row"><label class="field"><span>Abrechnungsbeginn</span><input id="g-start" type="date" value="' + esc(g.start) + '"></label>'
+      + '<label class="field"><span>Abschlag</span><div class="uw"><input id="g-adv" class="mono" inputmode="decimal" placeholder="z. B. 150" value="' + fin(g.advance) + '"><span class="u">€/Mon</span></div></label></div>'
+      + '<p class="hint">Der Betrag, den du zusammen für alles zahlst. Zähler und Festposten trägst du danach ein.</p>'
+      + '<div class="btns">' + (isNew ? '<button class="btn" data-close>Abbrechen</button>' : '') + '<button class="btn primary" id="g-save">' + (isNew ? 'Anlegen' : 'Speichern') + '</button></div>';
+    const d = gg.sheet(isNew ? 'Nebenkosten-Pauschale' : 'Pauschale bearbeiten', html), q = x => $(x, d);
+    q('#g-save').onclick = async () => {
+      const name = q('#g-name').value.trim(), start = q('#g-start').value, adv = pnum(q('#g-adv').value);
+      if (!name) return gg.toast('Gib der Pauschale einen Namen.');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return gg.toast('Wähle den Abrechnungsbeginn.');
+      if (!isFinite(adv) || adv < 0) return gg.toast('Trag den monatlichen Abschlag ein.');
+      Object.assign(g, { name, start, advance: adv, updated: Date.now() });
+      if (isNew) { g.id = gg.uid(); g.created = Date.now(); }
+      await db.put('groups', g); await persistOnce(); await load(); d.close(); gg.haptic();
+      if (isNew) { S.detail = g.id; history.pushState({ d: g.id }, ''); }
+      render(); window.scrollTo(0, 0);
+      gg.toast(isNew ? 'Angelegt. Jetzt Zähler und Festposten eintragen.' : 'Gespeichert');
+    };
+  }
+
+  function itemSheet(g, it) {
+    const isNew = !it;
+    it = it ? { ...it } : { name: '', amount: null, per: 'month' };
+    const html = '<label class="field"><span>Was ist das?</span><input id="i-name" maxlength="40" placeholder="z. B. Versicherung, Grundpacht, Garten" value="' + esc(it.name) + '"></label>'
+      + '<div class="row"><label class="field"><span>Betrag</span><div class="uw"><input id="i-amt" class="mono" inputmode="decimal" placeholder="0" value="' + fin(it.amount) + '"><span class="u">€</span></div></label>'
+      + '<label class="field"><span>Pro</span><select id="i-per"><option value="month"' + (it.per !== 'year' ? ' selected' : '') + '>Monat</option><option value="year"' + (it.per === 'year' ? ' selected' : '') + '>Jahr</option></select></label></div>'
+      + '<p class="hint">Kosten ohne Zähler, die im Abschlag mit drinstecken. Steht auf der Abrechnung der Jahresbetrag, nimm Jahr.</p>'
+      + '<div class="btns">' + (isNew ? '' : '<button class="btn danger" id="i-del" style="flex:0 0 auto" aria-label="Löschen">' + ic('trash') + '</button>') + '<button class="btn primary" id="i-save">Speichern</button></div>';
+    const d = gg.sheet(isNew ? 'Festposten' : 'Festposten bearbeiten', html), q = x => $(x, d);
+    if (q('#i-del')) q('#i-del').onclick = async () => {
+      if (!(await gg.confirm('"' + it.name + '" entfernen?'))) return;
+      g.fixed = g.fixed.filter(x => x.id !== it.id); await db.put('groups', g); await load(); d.close(); render();
+    };
+    q('#i-save').onclick = async () => {
+      const name = q('#i-name').value.trim(), amount = pnum(q('#i-amt').value);
+      if (!name) return gg.toast('Wie heißt der Posten?');
+      if (!isFinite(amount) || amount < 0) return gg.toast('Trag den Betrag ein.');
+      const out = { ...it, name, amount, per: q('#i-per').value, id: it.id || gg.uid() };
+      g.fixed = (g.fixed || []).filter(x => x.id !== out.id).concat([out]);
+      await db.put('groups', g); await load(); d.close(); gg.haptic(); render();
+    };
+    if (isNew) setTimeout(() => q('#i-name').focus(), 250);
+  }
+
+  function groupPriceSheet(g) {
+    const GA = anG(g);
+    const html = '<p class="small muted" style="margin:0 0 14px">Neuer Abschlag ab einem Datum, zum Beispiel nach der Nebenkostenabrechnung. Die Zeit davor rechnen wir mit dem alten Betrag.</p>'
+      + '<label class="field"><span>Gültig ab</span><input id="p-from" type="date" min="' + gg.addDays(g.start, 1) + '" max="' + gg.addDays(GA.P.end, -1) + '" value="' + tday() + '"></label>'
+      + '<label class="field"><span>Abschlag</span><div class="uw"><input id="p-adv" class="mono" inputmode="decimal" value="' + fin(GA.current.adv) + '"><span class="u">€/Mon</span></div></label>'
+      + '<div class="btns"><button class="btn" data-close>Abbrechen</button><button class="btn primary" id="p-save">Übernehmen</button></div>';
+    const d = gg.sheet('Abschlag ändern', html), q = x => $(x, d);
+    q('#p-save').onclick = async () => {
+      const from = q('#p-from').value, adv = pnum(q('#p-adv').value);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || from <= g.start || from >= GA.P.end) return gg.toast('Das Datum muss innerhalb der Periode liegen.');
+      if (!isFinite(adv) || adv < 0) return gg.toast('Bitte einen gültigen Betrag eintragen.');
+      g.changes = (g.changes || []).filter(c => c.from !== from).concat([{ from, advance: adv }]);
+      await db.put('groups', g); await load(); d.close(); render(); gg.toast('Gespeichert');
+    };
+  }
+
+  function groupPeriodSheet(g) {
+    const GA = anG(g), ns = GA.P.end;
+    const hd = head(GA.diff);
+    const info = GA.complete
+      ? '<div class="settle"><div class="tiny muted mono" style="margin-bottom:6px">abschluss der Periode</div>' + kv('Kosten', gg.eur(GA.cost)) + kv('Abschläge', gg.eur(GA.paid)) + kv('Ergebnis', hd.n + ' ' + hd.l) + '<p class="tiny muted" style="margin:6px 0 0">Wird mit der Hochrechnung archiviert. Trag davor die Endstände der Zähler ein.</p></div>'
+      : '<div class="note">Für ' + esc(GA.missing.map(x => x.name).join(', ')) + ' gibt es keine Schätzung. Die Periode wird ohne Ergebnis archiviert.</div>';
+    const html = info
+      + '<label class="field"><span>Neuer Beginn</span><input id="n-start" type="date" value="' + ns + '"></label>'
+      + '<label class="field"><span>Neuer Abschlag</span><div class="uw"><input id="n-adv" class="mono" inputmode="decimal" value="' + fin(GA.current.adv) + '"><span class="u">€/Mon</span></div></label>'
+      + '<p class="hint">Die Zähler startest du einzeln unter "Neue Abrechnungsperiode". Festposten bleiben, ändere sie bei Bedarf.</p>'
+      + '<div class="btns"><button class="btn" data-close>Abbrechen</button><button class="btn primary" id="n-save">Neu starten</button></div>';
+    const d = gg.sheet('Neue Abrechnungsperiode', html), q = x => $(x, d);
+    q('#n-save').onclick = async () => {
+      const start = q('#n-start').value, adv = pnum(q('#n-adv').value);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || start <= g.start) return gg.toast('Der neue Beginn muss nach dem alten liegen.');
+      if (!isFinite(adv) || adv < 0) return gg.toast('Bitte einen gültigen Betrag eintragen.');
+      await db.put('periods', { id: gg.uid(), meterId: g.id, start: g.start, end: start, cons: 0, unit: '', cost: GA.complete ? GA.cost : 0, paid: GA.complete ? GA.paid : 0, diff: GA.complete ? GA.diff : 0, annual: null, created: Date.now() });
+      Object.assign(g, { start, advance: adv, changes: (g.changes || []).filter(c => c.from > start), updated: Date.now() });
+      await db.put('groups', g); await load(); d.close(); render(); window.scrollTo(0, 0);
+      gg.toast('Neue Periode ab ' + gg.date(start));
+    };
+  }
+
   const stat = (k, val, x, cls) => '<div class="stat"><div class="k">' + k + '</div><div class="v ' + (cls || '') + '">' + val + '</div>' + (x ? '<div class="x">' + x + '</div>' : '<div class="x">&nbsp;</div>') + '</div>';
   const kv = (k, val) => '<div class="kv"><span>' + k + '</span><span>' + val + '</span></div>';
 
@@ -924,7 +1145,7 @@ if (typeof module !== 'undefined') module.exports = Z;
     h += '<p><b>1. Verbrauch bisher.</b> Letzter Stand minus Startstand' + (A.pts.some(p => p.swap) ? ', bei Zählerwechsel beide Zähler zusammen' : '') + (m.conv ? ', dann m³ × Brennwert × Zustandszahl = kWh' : '') + '.</p>';
     h += '<p><b>2. Jahreszeit.</b> Verteilung nach ' + prof + ', tagesgenau. Daraus folgt, welcher Anteil des Jahresverbrauchs bis zur letzten Ablesung typischerweise schon angefallen ist.</p>';
     h += '<p><b>3. Hochrechnung.</b> Verbrauch geteilt durch diesen Anteil. Bei wenig Daten mischen wir den Vorjahresverbrauch dazu, je mehr Daten, desto weniger.</p>';
-    h += '<p><b>4. Kosten.</b> Jahresverbrauch × Arbeitspreis + 12 × Grundpreis. Davon ziehen wir 12 Abschläge ab.</p>';
+    h += '<p><b>4. Kosten.</b> Jahresverbrauch × Arbeitspreis + 12 × Grundpreis.' + (grpOf(m) ? ' Diese Kosten gehen in den Sammel-Abschlag ein.' : ' Davon ziehen wir 12 Abschläge ab.') + '</p>';
     if (A.Y != null && A.pts.length) {
       const C = A.current;
       h += '<div class="fx">'
@@ -933,12 +1154,11 @@ if (typeof module !== 'undefined') module.exports = Z;
         + (A.mode === 'mix' ? '<span class="muted">gemischt mit Vorjahr ' + fc(A.prev) + ', Gewicht ' + pct(1 - A.trust, 0) + '</span><br>' : '')
         + '= ' + fc(A.Y) + ' ' + U + ' im Jahr<br>'
         + '× ' + gg.num(C.price, 2) + ' ct + 12 × ' + gg.eur(C.base) + '<br>'
-        + '= ' + gg.eur(A.cost) + ' <span class="muted">Jahreskosten</span><br>'
-        + '− ' + gg.eur(A.paid) + ' <span class="muted">Abschläge</span><br>'
-        + '= ' + gg.eur(Math.abs(A.diff)) + ' ' + (A.diff > 0 ? 'Nachzahlung' : 'Guthaben') + '</div>';
+        + '= ' + gg.eur(A.cost) + ' <span class="muted">Jahreskosten</span>'
+        + (grpOf(m) ? '' : '<br>− ' + gg.eur(A.paid) + ' <span class="muted">Abschläge</span><br>= ' + gg.eur(Math.abs(A.diff)) + ' ' + (A.diff > 0 ? 'Nachzahlung' : 'Guthaben')) + '</div>';
       if (A.tariffs.length > 1) h += '<p>Preisänderungen rechnen wir anteilig ab ihrem Datum, deshalb weicht das Ergebnis leicht von der einfachen Formel ab.</p>';
     }
-    h += '<p><b>Ampel.</b> Grün: Guthaben oder höchstens 3 % Nachzahlung. Gelb: bis 12 %. Rot: mehr. Empfohlener Abschlag: Jahreskosten ÷ 12, aufgerundet.</p>';
+    if (!grpOf(m)) h += '<p><b>Ampel.</b> Grün: Guthaben oder höchstens 3 % Nachzahlung. Gelb: bis 12 %. Rot: mehr. Empfohlener Abschlag: Jahreskosten ÷ 12, aufgerundet.</p>';
     h += '<p><b>Unsicherheit.</b> Je kleiner der abgelesene Anteil, desto breiter die Spanne. Wetter, Urlaub oder neue Geräte verschieben das Ergebnis. Monatlich ablesen macht es genauer.</p></div></details>';
     return h;
   }
@@ -1117,7 +1337,8 @@ if (typeof module !== 'undefined') module.exports = Z;
   function meterSheet(m) {
     const isNew = !m;
     const y = new Date().getFullYear();
-    m = m ? JSON.parse(JSON.stringify(m)) : { type: 'strom', unit: 'kWh', start: y + '-01-01', hs: 11.2, z: 0.95, conv: false };
+    m = m ? JSON.parse(JSON.stringify(m)) : { type: 'strom', unit: 'kWh', start: y + '-01-01', hs: 11.2, z: 0.95, conv: false, group: isGroup(S.detail) ? S.detail : null };
+    if (isNew && m.group) { const G0 = groupById(m.group); m.start = G0.start; }
     const tb = Object.entries(TYPES).map(([k, t]) => '<button type="button" data-type="' + k + '" class="' + (m.type === k ? 'on' : '') + '">' + ic(t.icon) + t.label + '</button>').join('');
     const units = ['kWh', 'm³', 'MWh', 'l'];
     const html = '<div class="types">' + tb + '</div>'
@@ -1127,14 +1348,15 @@ if (typeof module !== 'undefined') module.exports = Z;
       + '<div id="gasbox"><label class="check"><input type="checkbox" id="f-conv"' + (m.conv ? ' checked' : '') + '><span>Zähler zeigt m³, abgerechnet wird in kWh</span></label>'
       + '<div id="convf" class="' + (m.conv ? '' : 'hide') + '"><div class="row"><label class="field"><span>Brennwert</span><input id="f-hs" class="mono" inputmode="decimal" value="' + fin(m.hs || 11.2) + '"></label><label class="field"><span>Zustandszahl</span><input id="f-z" class="mono" inputmode="decimal" value="' + fin(m.z || 0.95) + '"></label></div>'
       + '<p class="hint">Beides steht auf deiner letzten Gasrechnung, meist in der Verbrauchsberechnung: m³ × Brennwert × Zustandszahl = kWh.</p></div></div>'
+      + (S.groups.length ? '<label class="field"><span>Wer bekommt den Abschlag?</span><select id="f-grp"><option value="">Dieser Zähler hat einen eigenen Abschlag</option>' + S.groups.map(x => '<option value="' + x.id + '"' + (m.group === x.id ? ' selected' : '') + '>Läuft über ' + esc(x.name) + '</option>').join('') + '</select></label>' : '')
       + '<div class="h" style="margin-top:6px">abrechnung</div>'
       + '<div class="row"><label class="field"><span>Abrechnungsbeginn</span><input id="f-start" type="date" value="' + esc(m.start || '') + '"></label>'
       + '<label class="field"><span>Stand zu Beginn</span><input id="f-sv" class="mono" inputmode="decimal" placeholder="0" value="' + fin(m.startValue) + '"></label></div>'
       + '<p class="hint">Beides steht auf deiner letzten Jahresabrechnung.</p>'
       + '<label class="field"><span id="l-price">Arbeitspreis</span><div class="uw"><input id="f-price" class="mono" inputmode="decimal" placeholder="z. B. 32,5" value="' + fin(m.price) + '"><span class="u" id="u-price">ct/kWh</span></div><small id="h-price"></small></label>'
       + '<div class="row"><label class="field"><span>Grundpreis</span><div class="uw"><input id="f-base" class="mono" inputmode="decimal" placeholder="0" value="' + fin(m.base) + '"><span class="u">€/Mon</span></div></label>'
-      + '<label class="field"><span>Abschlag</span><div class="uw"><input id="f-adv" class="mono" inputmode="decimal" placeholder="z. B. 85" value="' + fin(m.advance) + '"><span class="u">€/Mon</span></div></label></div>'
-      + '<p class="hint">Grundpreis pro Jahr? Teil ihn durch 12.</p>'
+      + '<label class="field" id="f-advw"><span>Abschlag</span><div class="uw"><input id="f-adv" class="mono" inputmode="decimal" placeholder="z. B. 85" value="' + fin(m.advance) + '"><span class="u">€/Mon</span></div></label></div>'
+      + '<p class="hint">Grundpreis pro Jahr? Teil ihn durch 12.</p><p class="hint hide" id="h-grp">Die Preise stehen in deiner Nebenkostenabrechnung. Den Abschlag zahlst du gesammelt, der Zähler braucht keinen eigenen.</p>'
       + '<label class="field"><span>Vorjahresverbrauch (optional)</span><div class="uw"><input id="f-prev" class="mono" inputmode="decimal" placeholder="laut letzter Rechnung" value="' + fin(m.prevYear) + '"><span class="u" id="u-prev">kWh</span></div><small>Macht die Schätzung in den ersten Wochen deutlich genauer.</small></label>'
       + '<div class="btns">' + (isNew ? '<button class="btn" data-close>Abbrechen</button>' : '') + '<button class="btn primary" id="f-save">' + (isNew ? 'Anlegen' : 'Speichern') + '</button></div>';
     const d = gg.sheet(isNew ? 'Zähler anlegen' : 'Zähler bearbeiten', html);
@@ -1147,6 +1369,8 @@ if (typeof module !== 'undefined') module.exports = Z;
       q('#convf').classList.toggle('hide', !conv);
       const U = conv ? 'kWh' : q('#f-unit').value;
       q('#u-price').textContent = 'ct/' + U; q('#u-prev').textContent = U;
+      const gr = q('#f-grp') && q('#f-grp').value;
+      q('#f-advw').classList.toggle('hide', !!gr); q('#h-grp').classList.toggle('hide', !gr);
       q('#h-price').textContent = m.type === 'wasser' ? 'In Cent: 4,20 € pro m³ sind 420 ct. Abwasser gleich mit einrechnen.' : (gas ? 'Bei Gas steht der Arbeitspreis meist in ct pro kWh.' : '');
     };
     q('#f-name').addEventListener('input', () => { named = true; });
@@ -1156,12 +1380,13 @@ if (typeof module !== 'undefined') module.exports = Z;
       if (!named) q('#f-name').value = TYPES[m.type].name;
       upd();
     });
-    q('#f-unit').onchange = upd; q('#f-conv').onchange = upd;
+    q('#f-unit').onchange = upd; q('#f-conv').onchange = upd; if (q('#f-grp')) q('#f-grp').onchange = upd;
     if (isNew && !q('#f-name').value) q('#f-name').value = TYPES[m.type].name;
     upd();
     q('#f-save').onclick = async () => {
       const name = q('#f-name').value.trim(), start = q('#f-start').value;
-      const sv = pnum(q('#f-sv').value || '0'), price = pnum(q('#f-price').value), base = pnum(q('#f-base').value || '0'), adv = pnum(q('#f-adv').value || '0');
+      const grp = q('#f-grp') ? q('#f-grp').value || null : null;
+      const sv = pnum(q('#f-sv').value || '0'), price = pnum(q('#f-price').value), base = pnum(q('#f-base').value || '0'), adv = grp ? 0 : pnum(q('#f-adv').value || '0');
       const prevRaw = q('#f-prev').value.trim(), prev = prevRaw ? pnum(prevRaw) : null;
       const unit = q('#f-unit').value, conv = m.type === 'gas' && unit === 'm³' && q('#f-conv').checked;
       const hs = pnum(q('#f-hs').value), z = pnum(q('#f-z').value);
@@ -1172,7 +1397,7 @@ if (typeof module !== 'undefined') module.exports = Z;
       if (!isNew && start !== m.start && S.readings.some(r => r.meterId === m.id && r.date <= start && r.date > m.start)) {
         if (!(await gg.confirm('Ablesungen vor dem neuen Abrechnungsbeginn zählen dann nicht mehr zu dieser Periode. Für einen Jahreswechsel nutze lieber "Neue Abrechnungsperiode".', 'Trotzdem ändern', false))) return;
       }
-      Object.assign(m, { name, start, startValue: sv, price, base, advance: adv, prevYear: prev, unit, conv, hs: conv ? hs : (m.hs || 11.2), z: conv ? z : (m.z || 0.95), number: q('#f-num').value.trim(), updated: Date.now() });
+      Object.assign(m, { name, start, startValue: sv, price, base, advance: adv, group: grp, prevYear: prev, unit, conv, hs: conv ? hs : (m.hs || 11.2), z: conv ? z : (m.z || 0.95), number: q('#f-num').value.trim(), updated: Date.now() });
       if (isNew) { m.id = gg.uid(); m.created = Date.now(); m.changes = []; }
       await db.put('meters', m); await persistOnce(); await load();
       d.close(); gg.haptic();
@@ -1185,7 +1410,7 @@ if (typeof module !== 'undefined') module.exports = Z;
   /* ---------- Ablesung ---------- */
   function readingSheet(r, meterId) {
     const isNew = !r;
-    r = r ? { ...r, swap: r.swap ? { ...r.swap } : null } : { meterId: meterId || S.detail || (S.filter !== 'all' && meterById(S.filter) ? S.filter : S.meters[0].id), date: tday(), value: null, swap: null, note: '' };
+    r = r ? { ...r, swap: r.swap ? { ...r.swap } : null } : { meterId: meterId || (meterById(S.detail) ? S.detail : null) || (S.filter !== 'all' && meterById(S.filter) ? S.filter : S.meters[0].id), date: tday(), value: null, swap: null, note: '' };
     let photo = r.photo || null, swapOn = !!r.swap, tmpUrl = null;
     const sel = S.meters.length > 1 ? '<label class="field"><span>Zähler</span><select id="r-m">' + S.meters.map(m => '<option value="' + m.id + '"' + (m.id === r.meterId ? ' selected' : '') + '>' + esc(m.name) + '</option>').join('') + '</select></label>' : '';
     const html = sel
@@ -1277,16 +1502,16 @@ if (typeof module !== 'undefined') module.exports = Z;
 
   /* ---------- Preisänderung ---------- */
   function priceSheet(m) {
-    const A = an(m), C = A.current, U = bu(m);
-    const html = '<p class="small muted" style="margin:0 0 14px">Neuer Preis oder neuer Abschlag ab einem Datum, zum Beispiel nach einer Preiserhöhung. Die Zeit davor rechnen wir mit den alten Werten.</p>'
+    const A = an(m), C = A.current, U = bu(m), G = grpOf(m);
+    const html = '<p class="small muted" style="margin:0 0 14px">Neuer Preis' + (G ? '' : ' oder neuer Abschlag') + ' ab einem Datum, zum Beispiel nach einer Preiserhöhung. Die Zeit davor rechnen wir mit den alten Werten.</p>'
       + '<label class="field"><span>Gültig ab</span><input id="p-from" type="date" min="' + gg.addDays(m.start, 1) + '" max="' + gg.addDays(A.P.end, -1) + '" value="' + tday() + '"></label>'
       + '<label class="field"><span>Arbeitspreis</span><div class="uw"><input id="p-price" class="mono" inputmode="decimal" value="' + fin(C.price) + '"><span class="u">ct/' + U + '</span></div></label>'
       + '<div class="row"><label class="field"><span>Grundpreis</span><div class="uw"><input id="p-base" class="mono" inputmode="decimal" value="' + fin(C.base) + '"><span class="u">€/Mon</span></div></label>'
-      + '<label class="field"><span>Abschlag</span><div class="uw"><input id="p-adv" class="mono" inputmode="decimal" value="' + fin(C.adv) + '"><span class="u">€/Mon</span></div></label></div>'
+      + (G ? '' : '<label class="field"><span>Abschlag</span><div class="uw"><input id="p-adv" class="mono" inputmode="decimal" value="' + fin(C.adv) + '"><span class="u">€/Mon</span></div></label>') + '</div>'
       + '<div class="btns"><button class="btn" data-close>Abbrechen</button><button class="btn primary" id="p-save">Übernehmen</button></div>';
     const d = gg.sheet('Preisänderung', html), q = s => $(s, d);
     q('#p-save').onclick = async () => {
-      const from = q('#p-from').value, price = pnum(q('#p-price').value), base = pnum(q('#p-base').value || '0'), adv = pnum(q('#p-adv').value || '0');
+      const from = q('#p-from').value, price = pnum(q('#p-price').value), base = pnum(q('#p-base').value || '0'), adv = G ? 0 : pnum(q('#p-adv').value || '0');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || from <= m.start || from >= A.P.end) return gg.toast('Das Datum muss innerhalb der Periode liegen.');
       if (![price, base, adv].every(v => isFinite(v) && v >= 0)) return gg.toast('Bitte gültige Zahlen eintragen.');
       m.changes = (m.changes || []).filter(c => c.from !== from).concat([{ from, price, base, advance: adv }]);
@@ -1300,10 +1525,10 @@ if (typeof module !== 'undefined') module.exports = Z;
     const ns = last ? last.date : A.P.end;
     const sv = last ? last.value : +m.startValue || 0;
     const sett = Z.settle(m, S.readings, tday());
-    const C = A.current;
+    const C = A.current, G = grpOf(m);
     const sug = sett && sett.annual && A.F(last.t) >= 0.5 ? Math.round(sett.annual) : (m.prevYear || null);
     let info = '';
-    if (sett) { const hd = head(sett.diff); info = '<div class="settle"><div class="tiny muted mono" style="margin-bottom:6px">abschluss bis ' + gg.date(sett.end) + '</div>' + kv('Verbrauch', fc(sett.cons) + ' ' + U) + kv('Kosten', gg.eur(sett.cost)) + kv('Abschläge', gg.eur(sett.paid)) + kv('Ergebnis', hd.n + ' ' + hd.l) + '<p class="tiny muted" style="margin:6px 0 0">Wird mit der alten Periode archiviert. Deine echte Jahresabrechnung kann etwas abweichen.</p></div>'; }
+    if (sett) { const hd = head(sett.diff); info = '<div class="settle"><div class="tiny muted mono" style="margin-bottom:6px">abschluss bis ' + gg.date(sett.end) + '</div>' + kv('Verbrauch', fc(sett.cons) + ' ' + U) + kv('Kosten', gg.eur(sett.cost)) + (G ? '' : kv('Abschläge', gg.eur(sett.paid)) + kv('Ergebnis', hd.n + ' ' + hd.l)) + '<p class="tiny muted" style="margin:6px 0 0">Wird mit der alten Periode archiviert. Deine echte Jahresabrechnung kann etwas abweichen.</p></div>'; }
     else info = '<div class="note">In dieser Periode gibt es noch keine Ablesung. Sie wird ohne Ergebnis archiviert.</div>';
     const html = info
       + '<div class="row"><label class="field"><span>Neuer Beginn</span><input id="n-start" type="date" value="' + ns + '"></label><label class="field"><span>Startstand</span><input id="n-sv" class="mono" inputmode="decimal" value="' + fin(sv) + '"></label></div>'
@@ -1311,12 +1536,12 @@ if (typeof module !== 'undefined') module.exports = Z;
       + '<div class="h" style="margin-top:4px">neuer tarif</div>'
       + '<label class="field"><span>Arbeitspreis</span><div class="uw"><input id="n-price" class="mono" inputmode="decimal" value="' + fin(C.price) + '"><span class="u">ct/' + U + '</span></div></label>'
       + '<div class="row"><label class="field"><span>Grundpreis</span><div class="uw"><input id="n-base" class="mono" inputmode="decimal" value="' + fin(C.base) + '"><span class="u">€/Mon</span></div></label>'
-      + '<label class="field"><span>Abschlag</span><div class="uw"><input id="n-adv" class="mono" inputmode="decimal" value="' + fin(C.adv) + '"><span class="u">€/Mon</span></div></label></div>'
+      + (G ? '' : '<label class="field"><span>Abschlag</span><div class="uw"><input id="n-adv" class="mono" inputmode="decimal" value="' + fin(C.adv) + '"><span class="u">€/Mon</span></div></label>') + '</div>'
       + '<label class="field"><span>Vorjahresverbrauch</span><div class="uw"><input id="n-prev" class="mono" inputmode="decimal" value="' + fin(sug) + '"><span class="u">' + U + '</span></div><small>Aus dieser Periode berechnet. Nimm den Wert der Rechnung, wenn du ihn hast.</small></label>'
       + '<div class="btns"><button class="btn" data-close>Abbrechen</button><button class="btn primary" id="n-save">Neu starten</button></div>';
     const d = gg.sheet('Neue Abrechnungsperiode', html), q = s => $(s, d);
     q('#n-save').onclick = async () => {
-      const start = q('#n-start').value, svv = pnum(q('#n-sv').value), price = pnum(q('#n-price').value), base = pnum(q('#n-base').value || '0'), adv = pnum(q('#n-adv').value || '0');
+      const start = q('#n-start').value, svv = pnum(q('#n-sv').value), price = pnum(q('#n-price').value), base = pnum(q('#n-base').value || '0'), adv = G ? 0 : pnum(q('#n-adv').value || '0');
       const pr = q('#n-prev').value.trim() ? pnum(q('#n-prev').value) : null;
       if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || start <= m.start) return gg.toast('Der neue Beginn muss nach dem alten liegen.');
       if (![svv, price, base, adv].every(v => isFinite(v) && v >= 0) || (pr != null && !(pr >= 0))) return gg.toast('Bitte gültige Zahlen eintragen.');
@@ -1357,7 +1582,7 @@ if (typeof module !== 'undefined') module.exports = Z;
     if (data.app !== 'zaehler') return gg.toast('Das ist keine Sicherung von zähler.');
     const n = (data.stores.meters || []).length, k = (data.stores.readings || []).length;
     if (!(await gg.confirm('Sicherung mit ' + n + ' Zählern und ' + k + ' Ablesungen einspielen? Die Daten auf diesem Gerät werden ersetzt.', 'Einspielen', false))) return;
-    try { await gg.backupImport('zaehler', db, text); } catch (e) { return gg.toast(e.message || 'Import fehlgeschlagen'); }
+    try { await gg.backupImport('zaehler', db, text); if (!data.stores.groups) await db.clear('groups'); } catch (e) { return gg.toast(e.message || 'Import fehlgeschlagen'); }
     await load(); S.detail = null; S.tab = 'home'; render(); gg.toast('Sicherung eingespielt');
   }
 
@@ -1400,23 +1625,35 @@ if (typeof module !== 'undefined') module.exports = Z;
   /* ---------- Ereignisse ---------- */
   function openDetail(id) { S.detail = id; history.pushState({ d: id }, ''); render(); window.scrollTo(0, 0); }
   function closeDetail() { if (history.state && history.state.d) history.back(); else { S.detail = null; render(); } }
-  window.addEventListener('popstate', () => { const st = history.state; S.detail = st && st.d && meterById(st.d) ? st.d : null; render(); window.scrollTo(0, 0); });
+  window.addEventListener('popstate', () => { const st = history.state; S.detail = st && st.d && (meterById(st.d) || groupById(st.d)) ? st.d : null; render(); window.scrollTo(0, 0); });
 
   document.addEventListener('click', async e => {
-    const t = e.target.closest('[data-act],[data-open],[data-reading],[data-filter],button[data-theme],[data-delchange]');
+    const t = e.target.closest('[data-act],[data-open],[data-reading],[data-filter],button[data-theme],[data-delchange],[data-item]');
     if (!t || t.closest('dialog')) return;
     if (t.dataset.open) return openDetail(t.dataset.open);
     if (t.dataset.reading) { const r = S.readings.find(x => x.id === t.dataset.reading); if (r) readingSheet(r); return; }
     if (t.dataset.filter) { S.filter = t.dataset.filter; return render(); }
     if (t.dataset.theme) { setTheme(t.dataset.theme); return render(); }
     if (t.dataset.delchange) {
-      const m = meterById(S.detail); if (!m) return;
-      if (!(await gg.confirm('Preisänderung ab ' + gg.date(t.dataset.delchange) + ' löschen?'))) return;
-      m.changes = (m.changes || []).filter(c => c.from !== t.dataset.delchange); await db.put('meters', m); await load(); return render();
+      const m = meterById(S.detail) || groupById(S.detail), tb = meterById(S.detail) ? 'meters' : 'groups'; if (!m) return;
+      if (!(await gg.confirm((tb === 'groups' ? 'Änderung' : 'Preisänderung') + ' ab ' + gg.date(t.dataset.delchange) + ' löschen?'))) return;
+      m.changes = (m.changes || []).filter(c => c.from !== t.dataset.delchange); await db.put(tb, m); await load(); return render();
     }
+    const g = groupById(S.detail);
+    if (t.dataset.item) { const it = g && (g.fixed || []).find(x => x.id === t.dataset.item); return it && itemSheet(g, it); }
     const m = meterById(S.detail);
     switch (t.dataset.act) {
       case 'newMeter': return meterSheet();
+      case 'newGroup': return groupSheet();
+      case 'editGroup': return g && groupSheet(g);
+      case 'addItem': return g && itemSheet(g);
+      case 'groupPrice': return g && groupPriceSheet(g);
+      case 'groupPeriod': return g && groupPeriodSheet(g);
+      case 'delGroup':
+        if (!g || !(await gg.confirm('"' + g.name + '" mit allen Festposten und früheren Perioden löschen? Die Zähler darin bleiben erhalten und bekommen wieder einen eigenen Abschlag.'))) return;
+        for (const x of membersOf(g)) await db.put('meters', { ...x, group: null });
+        for (const p of S.periods.filter(p => p.meterId === g.id)) await db.del('periods', p.id);
+        await db.del('groups', g.id); await load(); closeDetail(); return gg.toast('Gelöscht');
       case 'editMeter': return m && meterSheet(m);
       case 'back': return closeDetail();
       case 'addReading': return readingSheet(null, m && m.id);
@@ -1441,7 +1678,7 @@ if (typeof module !== 'undefined') module.exports = Z;
     }
   });
   $$('#tabs button').forEach(b => b.onclick = () => { if (S.detail) { S.detail = null; if (history.state && history.state.d) history.replaceState(null, ''); } S.tab = b.dataset.tab; render(); window.scrollTo(0, 0); });
-  $('#fab').onclick = () => S.meters.length ? readingSheet(null, S.detail) : meterSheet();
+  $('#fab').onclick = () => S.meters.length ? readingSheet(null, meterById(S.detail) ? S.detail : null) : meterSheet();
   $$('#tabs [data-i]').forEach(s => { s.outerHTML = ic(s.dataset.i); });
   $('#fab').innerHTML = ic('plus');
 
@@ -1452,7 +1689,7 @@ if (typeof module !== 'undefined') module.exports = Z;
 
   /* ---------- Start ---------- */
   setTheme(gg.theme());
-  try { db = await gg.openDB('zaehler', ['meters', 'readings', 'periods', 'meta']); await load(); }
+  try { db = await gg.openDB('zaehler', ['meters', 'readings', 'periods', 'meta', 'groups'], 2); await load(); }
   catch (e) { $('#view').innerHTML = '<div class="err">Der lokale Speicher ist nicht verfügbar. Im privaten Modus funktioniert zähler. eventuell nicht.</div>'; return; }
   history.replaceState(null, '');
   render();

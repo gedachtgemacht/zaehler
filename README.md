@@ -15,6 +15,7 @@ Reine Rechnung, keine KI, kein Server. Alles bleibt auf deinem Handy.
 ## Funktionen
 
 - **Zähler** für Strom, Gas, Wasser, Fernwärme und Sonstiges, mit Arbeitspreis, Grundpreis, Abschlag, Abrechnungsbeginn und Startstand von der letzten Rechnung
+- **Nebenkosten-Pauschale**: ein Abschlag für mehrere Zähler und Festposten zusammen, zum Beispiel 150 € im Monat für Warmwasser, Kaltwasser, Gas, Versicherung und Grundpacht. Die Ampel gilt für die Summe, nicht für jeden Zähler einzeln
 - **Gas in m³ oder kWh**, mit Umrechnung über Brennwert und Zustandszahl (Standard 11,2 und 0,95)
 - **Ampel** pro Zähler: reicht, knapp, reicht nicht
 - **Prognose** von Nachzahlung oder Guthaben, mit ehrlicher Spanne statt Scheingenauigkeit
@@ -72,6 +73,8 @@ Beispiel Gas: Beginn 1.1., Ablesung 30.6., 5.900 kWh. Januar bis Mai sind 53,5 %
 Liegt der Anteil unter 15 % und ist der Vorjahresverbrauch bekannt, wird gemischt: Gewicht der Hochrechnung = Anteil ÷ 15 %, der Rest kommt vom Vorjahr.
 
 **4. Kosten.** Jahreskosten = Jahresverbrauch × Arbeitspreis + 12 × Grundpreis. Gezahlt = 12 × Abschlag. Differenz = Nachzahlung (positiv) oder Guthaben. Empfohlener Abschlag = Jahreskosten ÷ 12, auf volle Euro aufgerundet. Bei Preisänderungen ab Datum wird jeder Abschnitt mit seinem Preis gerechnet.
+
+**Sammel-Abschlag.** Zähler in einer Nebenkosten-Pauschale werden einzeln hochgerechnet, ihre Jahreskosten addiert und um die Festposten (Betrag pro Monat × 12 oder pro Jahr) ergänzt. Davon gehen 12 Abschläge der Pauschale ab. Fehlt für einen Zähler noch eine Schätzung, zeigt die Pauschale kein Ergebnis, damit die Ampel nicht zu früh grün wird.
 
 **5. Ampel.** Guthaben oder Nachzahlung bis 3 % der Jahreskosten: grün. Bis 12 %: gelb. Darüber: rot.
 
